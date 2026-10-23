@@ -1,0 +1,1416 @@
+import base64
+import binascii
+import os
+import time
+import threading
+import collections
+import queue
+import json
+import functools
+import logging
+import shutil
+import tempfile
+from http import HTTPStatus
+from typing import Optional, List
+from urllib.parse import parse_qs, urlparse
+from fastapi import FastAPI, UploadFile, Form, Request, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.responses import PlainTextResponse, StreamingResponse
+import uvicorn
+from faster_whisper import WhisperModel
+import torch
+
+from enum import Enum
+
+import numpy as np
+from whisper_live import metrics as wl_metrics
+from websockets.sync.server import serve
+from websockets.exceptions import ConnectionClosed
+from whisper_live.vad import VoiceActivityDetector
+from whisper_live.backend.base import ServeClientBase
+from whisper_live.engine import registry as engine_registry
+from whisper_live.engine.options import negotiate_options
+
+logging.basicConfig(level=logging.INFO)
+
+# Model name OpenAI clients send when they do not name a whisper size.
+OPENAI_MODEL_ALIAS = "whisper-1"
+
+# faster-whisper model sizes that can be passed straight to WhisperModel().
+STOCK_MODEL_SIZES = frozenset({
+    "tiny", "tiny.en",
+    "base", "base.en",
+    "small", "small.en",
+    "medium", "medium.en",
+    "large-v2", "large-v3", "large-v3-turbo",
+})
+
+# REST routes that stay reachable without an API key.
+API_KEY_EXEMPT_PATHS = frozenset({"/docs", "/redoc", "/openapi.json", "/health"})
+
+# Subprotocol a browser offers as `new WebSocket(url, ["bearer", token])`.
+BEARER_SUBPROTOCOL = "bearer"
+
+
+def _select_bearer_subprotocol(connection, subprotocols):
+    """Echo the bearer marker, never the token beside it.
+
+    Chrome closes the socket when the 101 omits a subprotocol it offered.
+    """
+    if BEARER_SUBPROTOCOL in subprotocols:
+        return BEARER_SUBPROTOCOL
+    return None
+
+
+def _all_websocket_checks(checks, connection, request):
+    """Run every handshake check and return the first refusal."""
+    for check in checks:
+        response = check(connection, request)
+        if response is not None:
+            return response
+    return None
+
+
+def _offered_subprotocols(request):
+    header = request.headers.get("Sec-WebSocket-Protocol", "")
+    return [name.strip() for name in header.split(",") if name.strip()]
+
+
+def _websocket_auth(api_key, connection, request):
+    auth = request.headers.get("Authorization", "")
+    token_param = None
+    if "?" in request.path:
+        parsed = urlparse(request.path)
+        token_param = parse_qs(parsed.query).get("token", [None])[0]
+    offered = _offered_subprotocols(request)
+    bearer_subprotocol_token = BEARER_SUBPROTOCOL in offered and api_key in offered
+    if auth == f"Bearer {api_key}" or token_param == api_key or bearer_subprotocol_token:
+        return None
+    return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+
+
+class ClientManager:
+    def __init__(self, max_clients=4, max_connection_time=600):
+        """
+        Initializes the ClientManager with specified limits on client connections and connection durations.
+
+        Args:
+            max_clients (int, optional): The maximum number of simultaneous client connections allowed. Defaults to 4.
+            max_connection_time (int, optional): The maximum duration (in seconds) a client can stay connected. Defaults
+                                                 to 600 seconds (10 minutes).
+        """
+        self.clients = {}
+        self.start_times = {}
+        self.max_clients = max_clients
+        self.max_connection_time = max_connection_time
+        self.lock = threading.Lock()
+
+    def add_client(self, websocket, client):
+        """
+        Adds a client and their connection start time to the tracking dictionaries.
+
+        Args:
+            websocket: The websocket associated with the client to add.
+            client: The client object to be added and tracked.
+        """
+        with self.lock:
+            self.clients[websocket] = client
+            self.start_times[websocket] = time.time()
+
+    def get_client(self, websocket):
+        """
+        Retrieves a client associated with the given websocket.
+
+        Args:
+            websocket: The websocket associated with the client to retrieve.
+
+        Returns:
+            The client object if found, False otherwise.
+        """
+        with self.lock:
+            if websocket in self.clients:
+                return self.clients[websocket]
+            return False
+
+    def remove_client(self, websocket):
+        """
+        Removes a client and their connection start time from the tracking dictionaries. Performs cleanup on the
+        client if necessary.
+
+        Args:
+            websocket: The websocket associated with the client to be removed.
+        """
+        with self.lock:
+            client = self.clients.pop(websocket, None)
+            self.start_times.pop(websocket, None)
+        if client:
+            client.cleanup()
+
+    def get_wait_time(self):
+        """
+        Calculates the estimated wait time for new clients based on the remaining connection times of current clients.
+
+        Returns:
+            The estimated wait time in minutes for new clients to connect. Returns 0 if there are available slots.
+        """
+        with self.lock:
+            wait_time = None
+            for start_time in self.start_times.values():
+                current_client_time_remaining = self.max_connection_time - (time.time() - start_time)
+                if wait_time is None or current_client_time_remaining < wait_time:
+                    wait_time = current_client_time_remaining
+        return wait_time / 60 if wait_time is not None else 0
+
+    def is_server_full(self, websocket, options):
+        """
+        Checks if the server is at its maximum client capacity and sends a wait message to the client if necessary.
+
+        Args:
+            websocket: The websocket of the client attempting to connect.
+            options: A dictionary of options that may include the client's unique identifier.
+
+        Returns:
+            True if the server is full, False otherwise.
+        """
+        with self.lock:
+            if len(self.clients) >= self.max_clients:
+                wait_time = None
+                for start_time in self.start_times.values():
+                    remaining = self.max_connection_time - (time.time() - start_time)
+                    if wait_time is None or remaining < wait_time:
+                        wait_time = remaining
+                wait_time_minutes = wait_time / 60 if wait_time is not None else 0
+                response = {"uid": options["uid"], "status": "WAIT", "message": wait_time_minutes}
+                websocket.send(json.dumps(response))
+                return True
+            return False
+
+    def is_client_timeout(self, websocket):
+        """
+        Checks if a client has exceeded the maximum allowed connection time and disconnects them if so, issuing a warning.
+
+        Args:
+            websocket: The websocket associated with the client to check.
+
+        Returns:
+            True if the client's connection time has exceeded the maximum limit, False otherwise.
+        """
+        with self.lock:
+            elapsed_time = time.time() - self.start_times[websocket]
+            client = self.clients.get(websocket)
+        if elapsed_time >= self.max_connection_time and client:
+            client.disconnect()
+            logging.warning(f"Client with uid '{client.client_uid}' disconnected due to overtime.")
+            return True
+        return False
+
+
+class BackendType(Enum):
+    FASTER_WHISPER = "faster_whisper"
+    TENSORRT = "tensorrt"
+    OPENVINO = "openvino"
+
+    @staticmethod
+    def valid_types() -> List[str]:
+        return [backend_type.value for backend_type in BackendType]
+
+    @staticmethod
+    def is_valid(backend: str) -> bool:
+        return backend in BackendType.valid_types()
+
+    def is_faster_whisper(self) -> bool:
+        return self == BackendType.FASTER_WHISPER
+
+    def is_tensorrt(self) -> bool:
+        return self == BackendType.TENSORRT
+    
+    def is_openvino(self) -> bool:
+        return self == BackendType.OPENVINO
+
+
+class ExternalBackend:
+    """A backend that is not one of the built-in Whisper ``BackendType`` members.
+
+    Covers registry names (``sensevoice``, ``sherpa_onnx``) and ``package.module:Class``
+    plug-ins. Quacks like ``BackendType`` so the rest of the server needs no special cases.
+    """
+
+    def __init__(self, name: str):
+        self.value = name
+
+    def __eq__(self, other):
+        return isinstance(other, ExternalBackend) and other.value == self.value
+
+    def __hash__(self):
+        return hash(("external", self.value))
+
+    def __repr__(self):
+        return f"ExternalBackend({self.value!r})"
+
+    def is_faster_whisper(self) -> bool:
+        return False
+
+    def is_tensorrt(self) -> bool:
+        return False
+
+    def is_openvino(self) -> bool:
+        return False
+
+
+def make_backend_ref(name):
+    """``BackendType`` for the three built-in Whisper backends, ``ExternalBackend`` otherwise."""
+    if isinstance(name, (BackendType, ExternalBackend)):
+        return name
+    if BackendType.is_valid(name):
+        return BackendType(name)
+    engine_registry.resolve(name)  # raises ValueError for unknown names
+    return ExternalBackend(name)
+
+
+class AdmissionRateLimiter:
+    """Token bucket that admits at most ``per_second`` clients per second."""
+
+    def __init__(self, per_second):
+        self.per_second = per_second
+        self.tokens = per_second
+        self.refilled_at = time.monotonic()
+        self.lock = threading.Lock()
+
+    def allow(self):
+        with self.lock:
+            now = time.monotonic()
+            self.tokens = min(self.per_second, self.tokens + (now - self.refilled_at) * self.per_second)
+            self.refilled_at = now
+            if self.tokens < 1:
+                return False
+            self.tokens -= 1
+            return True
+
+
+class TranscriptionServer:
+    RATE = 16000
+    SECONDS_PER_MINUTE = 60
+
+    def __init__(self):
+        self.client_manager = None
+        self.no_voice_activity_chunks = 0
+        self.use_vad = True
+        self.single_model = False
+        self.batch_config = None
+        self.admission_limiter = None
+        self.raw_pcm_input = False
+        self.audio_formats = {}
+        self.segment_post_processor = None
+        self.transcript_finalizer = None
+        self.audio_preprocessor = None
+        self.default_model = "small"
+        self.backend_name = None
+        self.backend_opts = {}
+        self.engine_model = None
+        self.rest_models = {}
+        self.rest_models_lock = threading.Lock()
+
+    def initialize_client(
+        self, websocket, options, faster_whisper_custom_model_path,
+        whisper_tensorrt_path, trt_multilingual, trt_py_session=False,
+        audio_preprocessor=None,
+    ):
+        client: Optional[ServeClientBase] = None
+
+        # Non-Whisper backends: reconcile the request with what the model can do first,
+        # because that may switch translation on (task=translate is not native there).
+        if isinstance(self.backend, ExternalBackend):
+            options = self._negotiate_engine_options(websocket, options)
+            if options is None:
+                return
+
+        # Check if client wants translation
+        enable_translation = options.get("enable_translation", False)
+        
+        # Create translation queue if translation is enabled
+        translation_queue = None
+        translation_client = None
+        translation_thread = None
+        
+        if enable_translation:
+            target_language = options.get("target_language", "fr")
+            translation_queue = queue.Queue(maxsize=ServeClientBase.MAX_TRANSLATION_QUEUE_SIZE)
+            from whisper_live.backend.translation_backend import ServeClientTranslation
+            translation_client = ServeClientTranslation(
+                client_uid=options["uid"],
+                websocket=websocket,
+                translation_queue=translation_queue,
+                target_language=target_language,
+                send_last_n_segments=options.get("send_last_n_segments", 10)
+            )
+            
+            # Start translation thread
+            translation_thread = threading.Thread(
+                target=translation_client.speech_to_text,
+                daemon=True
+            )
+            translation_thread.start()
+            
+            logging.info(f"Translation enabled for client {options['uid']} with target language: {target_language}")
+
+        if isinstance(self.backend, ExternalBackend):
+            try:
+                client = self._create_engine_client(websocket, options, translation_queue)
+            except Exception as e:
+                logging.error(f"Failed to start backend '{self.backend.value}': {e}")
+                websocket.send(json.dumps({
+                    "uid": options["uid"],
+                    "status": "ERROR",
+                    "message": f"Failed to start backend: {self.backend.value}",
+                }))
+                websocket.close()
+                return
+
+        if self.backend.is_tensorrt():
+            try:
+                from whisper_live.backend.trt_backend import ServeClientTensorRT
+                client = ServeClientTensorRT(
+                    websocket,
+                    multilingual=trt_multilingual,
+                    language=options["language"],
+                    task=options["task"],
+                    client_uid=options["uid"],
+                    model=whisper_tensorrt_path,
+                    single_model=self.single_model,
+                    use_py_session=trt_py_session,
+                    send_last_n_segments=options.get("send_last_n_segments", 10),
+                    no_speech_thresh=options.get("no_speech_thresh", 0.45),
+                    clip_audio=options.get("clip_audio", False),
+                    same_output_threshold=options.get("same_output_threshold", 10),
+                )
+                logging.info("Running TensorRT backend.")
+            except Exception as e:
+                logging.error(f"TensorRT-LLM not supported: {e}")
+                self.client_uid = options["uid"]
+                websocket.send(json.dumps({
+                    "uid": self.client_uid,
+                    "status": "WARNING",
+                    "message": "TensorRT-LLM not supported on Server yet. "
+                               "Reverting to available backend: 'faster_whisper'"
+                }))
+                self.backend = BackendType.FASTER_WHISPER
+        
+        if self.backend.is_openvino():
+            try:
+                from whisper_live.backend.openvino_backend import ServeClientOpenVINO
+                client = ServeClientOpenVINO(
+                    websocket,
+                    language=options["language"],
+                    task=options["task"],
+                    client_uid=options["uid"],
+                    model=options["model"],
+                    single_model=self.single_model,
+                    send_last_n_segments=options.get("send_last_n_segments", 10),
+                    no_speech_thresh=options.get("no_speech_thresh", 0.45),
+                    clip_audio=options.get("clip_audio", False),
+                    same_output_threshold=options.get("same_output_threshold", 10),
+                )
+                logging.info("Running OpenVINO backend.")
+            except Exception as e:
+                logging.error(f"OpenVINO not supported: {e}")
+                self.backend = BackendType.FASTER_WHISPER
+                self.client_uid = options["uid"]
+                websocket.send(json.dumps({
+                    "uid": self.client_uid,
+                    "status": "WARNING",
+                    "message": "OpenVINO not supported on Server yet. "
+                                "Reverting to available backend: 'faster_whisper'"
+                }))
+
+        try:
+            if self.backend.is_faster_whisper():
+                from whisper_live.backend.faster_whisper_backend import ServeClientFasterWhisper
+                # model is of the form namespace/repo_name and not a filesystem path
+                if faster_whisper_custom_model_path is not None:
+                    logging.info(f"Using custom model {faster_whisper_custom_model_path}")
+                    options["model"] = faster_whisper_custom_model_path
+                client = ServeClientFasterWhisper(
+                    websocket,
+                    language=options["language"],
+                    task=options["task"],
+                    client_uid=options["uid"],
+                    model=options["model"],
+                    initial_prompt=options.get("initial_prompt"),
+                    vad_parameters=options.get("vad_parameters"),
+                    use_vad=self.use_vad,
+                    single_model=self.single_model,
+                    send_last_n_segments=options.get("send_last_n_segments", 10),
+                    no_speech_thresh=options.get("no_speech_thresh", 0.45),
+                    clip_audio=options.get("clip_audio", False),
+                    same_output_threshold=options.get("same_output_threshold", 10),
+                    cache_path=self.cache_path,
+                    translation_queue=translation_queue,
+                    hotwords=options.get("hotwords"),
+                    diarization=self._create_diarizer(options),
+                    word_timestamps=options.get("word_timestamps", False),
+                )
+
+                logging.info("Running faster_whisper backend.")
+
+                # Start batch inference worker on first client (after model is loaded)
+                if (self.batch_config is not None
+                        and ServeClientFasterWhisper.SINGLE_MODEL is not None):
+                    with ServeClientFasterWhisper.BATCH_WORKER_LOCK:
+                        if ServeClientFasterWhisper.BATCH_WORKER is None:
+                            from whisper_live.batch_inference import BatchInferenceWorker
+                            worker = BatchInferenceWorker(
+                                transcriber=ServeClientFasterWhisper.SINGLE_MODEL,
+                                **self.batch_config,
+                            )
+                            worker.start()
+                            ServeClientFasterWhisper.BATCH_WORKER = worker
+        except Exception as e:
+            logging.error(e)
+            return
+
+        if client is None:
+            raise ValueError(f"Backend type {self.backend.value} not recognised or not handled.")
+
+        # Attach segment post-processor if configured
+        if self.segment_post_processor is not None:
+            client.segment_post_processor = self.segment_post_processor
+
+        # Attach end-of-stream finalizer if configured
+        if self.transcript_finalizer is not None:
+            client.transcript_finalizer = self.transcript_finalizer
+
+        client.audio_preprocessor = audio_preprocessor or self.audio_preprocessor
+
+        if translation_client:
+            client.translation_client = translation_client
+            client.translation_thread = translation_thread
+
+        self.client_manager.add_client(websocket, client)
+
+    # ---- model-agnostic engine path ------------------------------------------------
+
+    def _negotiate_engine_options(self, websocket, options):
+        """Apply capability fallbacks; return the adjusted options, or None after refusing the client."""
+        caps = engine_registry.capabilities_for(self.backend.value)
+        options, warnings, error = negotiate_options(options, caps)
+        if error:
+            websocket.send(json.dumps({"uid": options["uid"], "status": "ERROR", "message": error}))
+            websocket.close()
+            return None
+        for message in warnings:
+            websocket.send(json.dumps({"uid": options["uid"], "status": "WARNING", "message": message}))
+        return options
+
+    def _create_engine_client(self, websocket, options, translation_queue):
+        """Build a WindowedSession or StreamingSession for a registry or plug-in backend."""
+        from whisper_live.engine.sessions import StreamingSession, WindowedSession
+
+        spec = engine_registry.resolve(self.backend.value)
+        kind = engine_registry.kind_of(spec)
+        opts = dict(self.backend_opts)
+        device = opts.pop("device", "cpu")
+        session_tuning = {k: opts.pop(k) for k in ("endpoint_silence_s", "max_window_s", "max_utterance_s")
+                          if k in opts}
+
+        use_vad = options.get("use_vad")
+        vad_threshold = (options.get("vad_parameters") or {}).get("threshold", 0.5)
+        common = dict(
+            client_uid=options["uid"],
+            language=options.get("language"),
+            task=options.get("task", "transcribe"),
+            use_vad=True if use_vad is None else use_vad,
+            vad_threshold=vad_threshold,
+            send_last_n_segments=options.get("send_last_n_segments", 10),
+            no_speech_thresh=options.get("no_speech_thresh", 0.45),
+            clip_audio=options.get("clip_audio", False),
+            same_output_threshold=options.get("same_output_threshold", 10),
+            translation_queue=translation_queue,
+            diarization=self._create_diarizer(options),
+            word_timestamps=options.get("word_timestamps", False),
+        )
+        if "endpoint_silence_s" in session_tuning:
+            common["min_endpoint_silence_s"] = session_tuning["endpoint_silence_s"]
+
+        if kind == engine_registry.OFFLINE:
+            backend = engine_registry.get_offline_backend(spec, self.engine_model, device, opts)
+            extra = {k: session_tuning[k] for k in ("max_window_s",) if k in session_tuning}
+            client = WindowedSession(
+                websocket, backend, self.backend.value,
+                hotwords=options.get("hotwords"), initial_prompt=options.get("initial_prompt"),
+                **extra, **common,
+            )
+        elif kind == engine_registry.STREAMING:
+            backend = engine_registry.new_streaming_backend(spec, self.engine_model, device, opts)
+            extra = {k: session_tuning[k] for k in ("max_utterance_s",) if k in session_tuning}
+            client = StreamingSession(websocket, backend, self.backend.value, **extra, **common)
+        else:
+            raise ValueError(f"Backend '{self.backend.value}' is neither an offline nor a streaming backend")
+        logging.info(f"Running {kind} backend '{self.backend.value}' with model '{self.engine_model}'.")
+        return client
+
+    def _preload_engine_backend(self):
+        """Load and warm the shared model at startup so /ready can mean ready."""
+        spec = engine_registry.resolve(self.backend_name)
+        kind = engine_registry.kind_of(spec)
+        cls = engine_registry.load_class(spec)
+        model = self.engine_model or getattr(cls, "DEFAULT_MODEL", None)
+        if not model:
+            raise ValueError(f"Backend '{self.backend_name}' needs --model")
+        self.engine_model = model
+        opts = dict(self.backend_opts)
+        device = opts.pop("device", "cpu")
+        for k in ("endpoint_silence_s", "max_window_s", "max_utterance_s"):
+            opts.pop(k, None)
+        if kind == engine_registry.OFFLINE:
+            engine_registry.get_offline_backend(spec, model, device, opts, warmup=True)
+        elif kind == engine_registry.STREAMING:
+            engine_registry.new_streaming_backend(spec, model, device, opts)  # fail fast on bad paths
+        else:
+            raise ValueError(f"Backend '{self.backend_name}' must be an OfflineBackend or StreamingBackend")
+
+    def _create_diarizer(self, options):
+        """Create a SpeakerDiarizer if the client requested diarization.
+
+        Diarization is created when the handshake sets ``enable_diarization`` or
+        carries ``known_speakers``. Each known speaker is a dict with a ``name``
+        and base64-encoded reference audio under ``audio_base64``.
+
+        Returns:
+            SpeakerDiarizer or None
+        """
+        known_speakers = options.get("known_speakers") or []
+        if not options.get("enable_diarization", False) and not known_speakers:
+            return None
+        try:
+            from whisper_live.diarization import SpeakerDiarizer
+            diarizer = SpeakerDiarizer(
+                similarity_threshold=options.get("diarization_threshold", 0.55),
+                max_speakers=max(options.get("max_speakers", 10), len(known_speakers)),
+                hf_token=options.get("hf_token"),
+            )
+        except ImportError:
+            logging.warning("pyannote.audio not installed; diarization disabled")
+            return None
+        self._enroll_known_speakers(diarizer, known_speakers)
+        return diarizer
+
+    @staticmethod
+    def _enroll_known_speakers(diarizer, known_speakers):
+        """Enroll base64-encoded reference clips from the handshake into a diarizer.
+
+        Args:
+            diarizer (SpeakerDiarizer): The diarizer to enroll into.
+            known_speakers (list): Dicts with ``name`` and ``audio_base64`` keys.
+        """
+        from whisper_live.diarization import load_audio
+
+        for speaker in known_speakers:
+            name = speaker.get("name")
+            audio_base64 = speaker.get("audio_base64")
+            if not name or not audio_base64:
+                logging.warning("Skipping known speaker without a name or audio_base64")
+                continue
+            reference_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    tmp.write(base64.b64decode(audio_base64))
+                    reference_path = tmp.name
+                if diarizer.enroll_speaker(name, load_audio(reference_path)):
+                    logging.info(f"Enrolled known speaker '{name}'")
+                else:
+                    logging.warning(f"Reference audio for known speaker '{name}' is too short")
+            except (binascii.Error, ValueError) as e:
+                logging.error(f"Failed to enroll known speaker '{name}': {e}")
+            finally:
+                if reference_path and os.path.exists(reference_path):
+                    os.unlink(reference_path)
+
+    def get_audio_from_websocket(self, websocket):
+        """
+        Receives audio buffer from websocket and creates a numpy array out of it.
+
+        Args:
+            websocket: The websocket to receive audio from.
+
+        Returns:
+            A numpy array containing the audio.
+        """
+        frame_data = websocket.recv()
+        if frame_data == b"END_OF_AUDIO":
+            return False
+        audio_format = self.audio_formats.get(websocket)
+        if audio_format == "uint8":
+            audio_np = np.frombuffer(frame_data, dtype=np.uint8)
+            return (audio_np.astype(np.float32) - 128.0) / 128.0
+        if self.raw_pcm_input or audio_format == "int16":
+            # a ragged frame (odd byte count) loses its last byte instead of killing the session
+            audio_np = np.frombuffer(frame_data[: len(frame_data) // 2 * 2], dtype=np.int16)
+            return audio_np.astype(np.float32) / 32768.0
+        return np.frombuffer(frame_data[: len(frame_data) // 4 * 4], dtype=np.float32)
+
+    def batch_admission_refusal(self, websocket, options):
+        """Why a new client is turned away in batch mode, None when it may connect.
+
+        Refused clients get a WAIT carrying minutes, matching ``ClientManager.is_server_full``.
+        """
+        from whisper_live.backend.faster_whisper_backend import ServeClientFasterWhisper
+
+        worker = ServeClientFasterWhisper.BATCH_WORKER
+        if worker is None:
+            return None
+        if worker.overloaded():
+            reason = "overloaded"
+        elif self.admission_limiter is not None and not self.admission_limiter.allow():
+            reason = "rate_limited"
+        else:
+            return None
+        response = {
+            "uid": options["uid"],
+            "status": "WAIT",
+            "message": worker.queue_wait_s / self.SECONDS_PER_MINUTE,
+        }
+        websocket.send(json.dumps(response))
+        return reason
+
+    def handle_new_connection(self, websocket, faster_whisper_custom_model_path,
+                              whisper_tensorrt_path, trt_multilingual, trt_py_session=False):
+        try:
+            logging.info("New client connected")
+            options = websocket.recv()
+            options = json.loads(options)
+
+            self.use_vad = options.get('use_vad')
+            if self.client_manager.is_server_full(websocket, options):
+                wl_metrics.track_connection_rejected(reason="full")
+                websocket.close()
+                return False  # Indicates that the connection should not continue
+            refusal = self.batch_admission_refusal(websocket, options)
+            if refusal:
+                wl_metrics.track_connection_rejected(reason=refusal)
+                websocket.close()
+                return False
+            audio_format = options.get("audio_format", "float32")
+            if audio_format not in {"float32", "int16", "uint8"}:
+                raise ValueError(f"Unsupported audio_format: {audio_format}")
+            self.audio_formats[websocket] = audio_format
+
+            if self.backend.is_tensorrt():
+                self.vad_detector = VoiceActivityDetector(frame_rate=self.RATE)
+            self.initialize_client(websocket, options, faster_whisper_custom_model_path,
+                                   whisper_tensorrt_path, trt_multilingual, trt_py_session=trt_py_session)
+            if isinstance(self.backend, ExternalBackend) and not self.client_manager.get_client(websocket):
+                # the client was refused (e.g. unsupported language) and already told why
+                self.audio_formats.pop(websocket, None)
+                return False
+            wl_metrics.track_connection_opened()
+            return True
+        except json.JSONDecodeError:
+            logging.error("Failed to decode JSON from client")
+            return False
+        except ConnectionClosed:
+            logging.info("Connection closed by client")
+            return False
+        except Exception as e:
+            logging.error(f"Error during new connection initialization: {str(e)}")
+            return False
+
+    def process_audio_frames(self, websocket):
+        frame_np = self.get_audio_from_websocket(websocket)
+        client = self.client_manager.get_client(websocket)
+        if frame_np is False:
+            if self.backend.is_tensorrt():
+                client.set_eos(True)
+            if isinstance(self.backend, ExternalBackend) and hasattr(client, "end_of_audio"):
+                client.end_of_audio()
+            return False
+
+        preprocessor = getattr(client, "audio_preprocessor", None)
+        if preprocessor is not None:
+            try:
+                frame_np = preprocessor(frame_np, self.RATE)
+            except Exception as e:
+                logging.error(f"audio_preprocessor failed: {e}")
+
+        if self.backend.is_tensorrt():
+            voice_active = self.voice_activity(websocket, frame_np)
+            if voice_active:
+                self.no_voice_activity_chunks = 0
+                client.set_eos(False)
+            if self.use_vad and not voice_active:
+                return True
+
+        client.add_frames(frame_np)
+        return True
+
+    def recv_audio(self,
+                   websocket,   
+                   backend: BackendType = BackendType.FASTER_WHISPER,
+                   faster_whisper_custom_model_path=None,
+                   whisper_tensorrt_path=None,
+                   trt_multilingual=False,
+                   trt_py_session=False):
+        """
+        Receive audio chunks from a client in an infinite loop.
+
+        Continuously receives audio frames from a connected client
+        over a WebSocket connection. It processes the audio frames using a
+        voice activity detection (VAD) model to determine if they contain speech
+        or not. If the audio frame contains speech, it is added to the client's
+        audio data for ASR.
+        If the maximum number of clients is reached, the method sends a
+        "WAIT" status to the client, indicating that they should wait
+        until a slot is available.
+        If a client's connection exceeds the maximum allowed time, it will
+        be disconnected, and the client's resources will be cleaned up.
+
+        Args:
+            websocket (WebSocket): The WebSocket connection for the client.
+            backend (str): The backend to run the server with.
+            faster_whisper_custom_model_path (str): path to custom faster whisper model.
+            whisper_tensorrt_path (str): Required for tensorrt backend.
+            trt_multilingual(bool): Only used for tensorrt, True if multilingual model.
+
+        Raises:
+            Exception: If there is an error during the audio frame processing.
+        """
+        self.backend = backend
+        if not self.handle_new_connection(websocket, faster_whisper_custom_model_path,
+                                          whisper_tensorrt_path, trt_multilingual, trt_py_session=trt_py_session):
+            return
+
+        try:
+            while not self.client_manager.is_client_timeout(websocket):
+                if not self.process_audio_frames(websocket):
+                    break
+            # stream ended normally (END_OF_AUDIO or timeout); socket still open,
+            # so run any end-of-stream finalizer before cleanup closes it.
+            client = self.client_manager.get_client(websocket)
+            if client:
+                client.finalize()
+        except ConnectionClosed:
+            logging.info("Connection closed by client")
+        except Exception as e:
+            logging.error(f"Unexpected error: {str(e)}")
+        finally:
+            if self.client_manager.get_client(websocket):
+                self.cleanup(websocket)
+                websocket.close()
+            wl_metrics.track_connection_closed()
+            del websocket
+
+    def _resolve_rest_model(self, requested_model):
+        """Map the REST ``model`` form field onto a faster-whisper model name.
+
+        Accepts a stock size name, a local path or a HuggingFace repo id. Anything
+        else, including the ``whisper-1`` alias and an absent field, falls back to
+        the server's default model.
+
+        Args:
+            requested_model (str or None): The ``model`` value sent by the client.
+
+        Returns:
+            str: The model name or path to load.
+        """
+        if not requested_model or requested_model == OPENAI_MODEL_ALIAS:
+            return self.default_model
+        if requested_model in STOCK_MODEL_SIZES:
+            return requested_model
+        if os.path.exists(requested_model) or "/" in requested_model:
+            return requested_model
+        logging.warning(f"Unknown model '{requested_model}'; using '{self.default_model}' instead.")
+        return self.default_model
+
+    def _get_rest_model(self, model_name):
+        """Return a cached ``WhisperModel`` for ``model_name``, loading it once.
+
+        Args:
+            model_name (str): Model name or path accepted by faster-whisper.
+
+        Returns:
+            WhisperModel: The shared model instance for that name.
+        """
+        with self.rest_models_lock:
+            transcriber = self.rest_models.get(model_name)
+            if transcriber is None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                compute_type = "float16" if device == "cuda" else "int8"
+                logging.info(f"Loading REST model '{model_name}' on {device}")
+                transcriber = WhisperModel(model_name, device=device, compute_type=compute_type)
+                self.rest_models[model_name] = transcriber
+            return transcriber
+
+    def _stream_transcription(self, file, language, prompt, temperature,
+                              timestamp_granularities,
+                              requested_model=None):
+        """Return a StreamingResponse that yields SSE events per segment.
+
+        The first event carries the detected language and its probability, then
+        one event per segment, then ``[DONE]``.
+        """
+
+        async def _sse_generator():
+            tmp_path = None
+            try:
+                suffix = os.path.splitext(file.filename)[1] or ".wav"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    shutil.copyfileobj(file.file, tmp)
+                    tmp_path = tmp.name
+
+                transcriber = self._get_rest_model(self._resolve_rest_model(requested_model))
+                segments, info = transcriber.transcribe(
+                    tmp_path,
+                    language=language,
+                    initial_prompt=prompt,
+                    temperature=temperature,
+                    vad_filter=False,
+                    word_timestamps=(timestamp_granularities and "word" in timestamp_granularities),
+                )
+
+                metadata = {
+                    "type": "metadata",
+                    "language": info.language,
+                    "language_probability": info.language_probability,
+                }
+                yield f"data: {json.dumps(metadata)}\n\n"
+
+                for seg in segments:
+                    seg_dict = {
+                        "id": seg.id,
+                        "start": seg.start,
+                        "end": seg.end,
+                        "text": seg.text.strip(),
+                    }
+                    if timestamp_granularities and "word" in timestamp_granularities:
+                        seg_dict["words"] = [
+                            {"word": w.word, "start": w.start, "end": w.end, "probability": w.probability}
+                            for w in seg.words
+                        ]
+                    yield f"data: {json.dumps(seg_dict)}\n\n"
+
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+        return StreamingResponse(_sse_generator(), media_type="text/event-stream")
+
+    @staticmethod
+    def _normalize_form_list(values):
+        """Normalize repeated or comma-separated multipart form fields."""
+        if not values:
+            return []
+        normalized = []
+        for value in values:
+            if isinstance(value, str):
+                normalized.extend(item.strip() for item in value.split(",") if item.strip())
+        return normalized
+
+    async def _create_rest_diarizer(self, known_speaker_names, known_speaker_references):
+        """Create a diarizer from OpenAI-compatible known speaker fields."""
+        speaker_names = self._normalize_form_list(known_speaker_names)
+        speaker_references = known_speaker_references or []
+
+        if speaker_references and not speaker_names:
+            raise ValueError("known_speaker_references requires matching known_speaker_names")
+        if speaker_names and speaker_references and len(speaker_names) != len(speaker_references):
+            raise ValueError("known_speaker_names and known_speaker_references must have the same length")
+        if not speaker_names and not speaker_references:
+            return None
+
+        from whisper_live.diarization import SpeakerDiarizer, load_audio
+
+        diarizer = SpeakerDiarizer(
+            max_speakers=max(10, len(speaker_names)),
+            speaker_names=speaker_names,
+        )
+
+        for speaker_name, reference in zip(speaker_names, speaker_references):
+            suffix = os.path.splitext(reference.filename or "")[1] or ".wav"
+            reference_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(await reference.read())
+                    reference_path = tmp.name
+                audio_np = load_audio(reference_path)
+                if not diarizer.enroll_speaker(speaker_name, audio_np):
+                    raise ValueError(f"known_speaker_references for '{speaker_name}' is too short")
+            finally:
+                if reference_path and os.path.exists(reference_path):
+                    os.unlink(reference_path)
+
+        return diarizer
+
+    @staticmethod
+    def _speaker_labels_for_segments(segments, audio_np, diarizer, sample_rate=16000):
+        if diarizer is None or audio_np is None:
+            return {}
+        labels = {}
+        for index, segment in enumerate(segments):
+            start = max(0, int(segment.start * sample_rate))
+            end = min(len(audio_np), int(segment.end * sample_rate))
+            if end <= start:
+                continue
+            speaker = diarizer.identify_speaker(audio_np[start:end], sample_rate)
+            if speaker:
+                labels[index] = speaker
+        return labels
+
+    def build_rest_app(self, backend, faster_whisper_custom_model_path=None,
+                       whisper_tensorrt_path=None, cors_origins=None,
+                       api_key=None, rate_limit_rpm=0):
+        """Build the OpenAI-compatible REST app served alongside the WebSocket server.
+
+        Args:
+            backend (str): Backend name reported by ``/health``.
+            faster_whisper_custom_model_path (str, optional): Custom model reported by ``/health``.
+            whisper_tensorrt_path (str, optional): TensorRT model reported by ``/health``.
+            cors_origins (str, optional): Comma-separated list of allowed CORS origins.
+            api_key (str, optional): When set, every route except ``API_KEY_EXEMPT_PATHS``
+                requires an ``Authorization: Bearer`` header carrying this key.
+            rate_limit_rpm (int): Requests per minute per client IP. 0 disables the limit.
+
+        Returns:
+            FastAPI: The configured app.
+        """
+        app = FastAPI(title="WhisperLive OpenAI-Compatible API")
+        origins = [o.strip() for o in cors_origins.split(',')] if cors_origins else []
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+            allow_headers=["*"],  # Allows all headers
+        )
+
+        # Optional API key authentication
+        if api_key:
+            @app.middleware("http")
+            async def _check_api_key(request: Request, call_next):
+                if request.url.path not in API_KEY_EXEMPT_PATHS:
+                    auth = request.headers.get("Authorization", "")
+                    if auth != f"Bearer {api_key}":
+                        return JSONResponse({"error": "Invalid or missing API key"}, status_code=401)
+                return await call_next(request)
+
+        # Optional rate limiting (requests per minute per client IP)
+        if rate_limit_rpm > 0:
+            _rate_lock = threading.Lock()
+            _rate_buckets: dict = {}  # ip -> deque of timestamps
+
+            @app.middleware("http")
+            async def _rate_limit(request: Request, call_next):
+                client_ip = request.client.host if request.client else "unknown"
+                now = time.time()
+                with _rate_lock:
+                    bucket = _rate_buckets.setdefault(client_ip, collections.deque())
+                    # Discard entries older than 60s
+                    while bucket and bucket[0] < now - 60:
+                        bucket.popleft()
+                    if len(bucket) >= rate_limit_rpm:
+                        return JSONResponse({"error": "Rate limit exceeded"}, status_code=429)
+                    bucket.append(now)
+                return await call_next(request)
+
+        health_model = faster_whisper_custom_model_path or whisper_tensorrt_path or self.default_model
+
+        @app.get("/health")
+        async def health():
+            """Report backend, model and client occupancy without requiring an API key."""
+            return {
+                "status": "ok",
+                "backend": backend,
+                "model": health_model,
+                "clients": len(self.client_manager.clients),
+                "max_clients": self.client_manager.max_clients,
+            }
+
+        @app.post("/v1/audio/transcriptions")
+        async def transcribe(
+            file: UploadFile,
+            model: str = Form(default="whisper-1"),
+            language: Optional[str] = Form(default=None),
+            prompt: Optional[str] = Form(default=None),
+            response_format: str = Form(default="json"),
+            temperature: float = Form(default=0.0),
+            timestamp_granularities: Optional[List[str]] = Form(default=None),
+            # Stubs for unsupported OpenAI params
+            chunking_strategy: Optional[str] = Form(default=None),
+            include: Optional[List[str]] = Form(default=None),
+            known_speaker_names: Optional[List[str]] = Form(default=None),
+            known_speaker_references: Optional[List[UploadFile]] = File(default=None),
+            stream: bool = Form(default=False),
+            hotwords: Optional[str] = Form(default=None),
+        ):
+            if stream:
+                return self._stream_transcription(
+                    file, language, prompt, temperature,
+                    timestamp_granularities,
+                    model,
+                )
+
+            ignored_params = []
+            if chunking_strategy:
+                ignored_params.append(f"chunking_strategy='{chunking_strategy}'")
+            if include:
+                ignored_params.append(f"include={include}")
+            if ignored_params:
+                logging.warning(f"Unsupported OpenAI params ignored: {', '.join(ignored_params)}")
+
+            supported_formats = ["json", "text", "srt", "verbose_json", "vtt"]
+            if response_format not in supported_formats:
+                wl_metrics.track_rest_request(endpoint="transcriptions", status=400)
+                return JSONResponse({"error": f"Unsupported response_format. Supported: {supported_formats}"}, status_code=400)
+
+            model_name = self._resolve_rest_model(model)
+
+            tmp_path = None
+            try:
+                suffix = os.path.splitext(file.filename)[1] or ".wav"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    shutil.copyfileobj(file.file, tmp)
+                    tmp_path = tmp.name
+
+                transcriber = self._get_rest_model(model_name)
+                segments, info = transcriber.transcribe(
+                    tmp_path,
+                    language=language,
+                    initial_prompt=prompt,
+                    temperature=temperature,
+                    vad_filter=False,
+                    word_timestamps=(timestamp_granularities and "word" in timestamp_granularities),
+                    hotwords=hotwords,
+                )
+                segments = list(segments)
+
+                text = " ".join([s.text.strip() for s in segments])
+
+                if response_format == "text":
+                    wl_metrics.track_rest_request(endpoint="transcriptions", status=200)
+                    return PlainTextResponse(text)
+                elif response_format == "json":
+                    wl_metrics.track_rest_request(endpoint="transcriptions", status=200)
+                    return {
+                        "text": text,
+                        "language": info.language,
+                        "language_probability": info.language_probability,
+                    }
+                elif response_format == "verbose_json":
+                    verbose = {
+                        "task": "transcribe",
+                        "language": info.language,
+                        "language_probability": info.language_probability,
+                        "duration": info.duration,
+                        "text": text,
+                        "segments": []
+                    }
+                    speaker_labels = {}
+                    try:
+                        rest_diarizer = await self._create_rest_diarizer(known_speaker_names, known_speaker_references)
+                    except ValueError as e:
+                        wl_metrics.track_rest_request(endpoint="transcriptions", status=400)
+                        return JSONResponse({"error": str(e)}, status_code=400)
+                    if rest_diarizer is not None:
+                        from whisper_live.diarization import load_audio
+                        audio_np = load_audio(tmp_path)
+                        speaker_labels = self._speaker_labels_for_segments(segments, audio_np, rest_diarizer)
+                    for index, seg in enumerate(segments):
+                        seg_dict = {
+                            "id": seg.id,
+                            "seek": seg.seek,
+                            "start": seg.start,
+                            "end": seg.end,
+                            "text": seg.text.strip(),
+                            "tokens": seg.tokens,
+                            "temperature": seg.temperature,
+                            "avg_logprob": seg.avg_logprob,
+                            "compression_ratio": seg.compression_ratio,
+                            "no_speech_prob": seg.no_speech_prob
+                        }
+                        if index in speaker_labels:
+                            seg_dict["speaker"] = speaker_labels[index]
+                        if timestamp_granularities and "word" in timestamp_granularities:
+                            seg_dict["words"] = [{"word": w.word, "start": w.start, "end": w.end, "probability": w.probability} for w in seg.words]
+                        verbose["segments"].append(seg_dict)
+                    wl_metrics.track_rest_request(endpoint="transcriptions", status=200)
+                    return verbose
+                elif response_format in ["srt", "vtt"]:
+                    output = []
+                    for i, seg in enumerate(segments, 1):
+                        start = f"{int(seg.start // 3600):02}:{int((seg.start % 3600) // 60):02}:{seg.start % 60:06.3f}"
+                        end = f"{int(seg.end // 3600):02}:{int((seg.end % 3600) // 60):02}:{seg.end % 60:06.3f}"
+                        if response_format == "srt":
+                            output.append(f"{i}\n{start.replace('.', ',')} --> {end.replace('.', ',')}\n{seg.text.strip()}\n")
+                        else:  # vtt
+                            output.append(f"{start} --> {end}\n{seg.text.strip()}\n")
+                    wl_metrics.track_rest_request(endpoint="transcriptions", status=200)
+                    return PlainTextResponse("\n".join(output))
+            except Exception as e:
+                wl_metrics.track_rest_request(endpoint="transcriptions", status=500)
+                wl_metrics.track_error("rest_transcription")
+                return JSONResponse({"error": str(e)}, status_code=500)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+        return app
+
+    def run(self,
+            host,
+            port=9090,
+            backend="tensorrt",
+            faster_whisper_custom_model_path=None,
+            whisper_tensorrt_path=None,
+            trt_multilingual=False,
+            trt_py_session=False,
+            single_model=False,
+            max_clients=4,
+            max_connection_time=600,
+            cache_path="~/.cache/whisper-live/",
+            rest_port=8000,
+            enable_rest=False,
+            cors_origins: Optional[str] = None,
+            batch_enabled=False,
+            batch_max_size=16,
+            batch_window_ms=50,
+            batch_max_queue_wait_s=0.5,
+            batch_max_admissions_per_s=5.0,
+            batch_beam_size=1,
+            batch_temperature_fallback=False,
+            raw_pcm_input=False,
+            metrics_port: int = 0,
+            api_key: Optional[str] = None,
+            websocket_auth=None,
+            rate_limit_rpm: int = 0,
+            segment_post_processor=None,
+            transcript_finalizer=None,
+            audio_preprocessor=None,
+            default_model: str = "small",
+            model: Optional[str] = None,
+            backend_opts: Optional[dict] = None):
+        """
+        Run the transcription server.
+
+        Args:
+            host (str): The host address to bind the server.
+            port (int): The port number to bind the server.
+            backend (str): ``faster_whisper``, ``tensorrt``, ``openvino``, a registered name
+                such as ``sensevoice`` or ``sherpa_onnx``, or ``package.module:Class``.
+            model (str, optional): Model path or hub id. For ``faster_whisper`` and ``tensorrt``
+                it is the same as the older ``faster_whisper_custom_model_path`` /
+                ``whisper_tensorrt_path`` arguments, which still work.
+            backend_opts (dict, optional): Extra options passed to the backend's ``load()``
+                (``--backend_opt key=value`` on the command line).
+            batch_enabled (bool): Enable cross-client GPU batch inference for
+                the faster_whisper backend. When enabled, ``single_model`` is
+                forced to True and a ``BatchInferenceWorker`` is started after
+                the first client connects. Defaults to False.
+            batch_max_size (int): Maximum number of requests per GPU batch.
+                Defaults to 16.
+            batch_window_ms (int): Maximum time in milliseconds to wait for
+                the batch to fill after the first request arrives. Defaults
+                to 50.
+            batch_max_queue_wait_s (float): Measured batch queue wait in
+                seconds above which new clients are turned away with a WAIT
+                message. Defaults to 0.5.
+            batch_max_admissions_per_s (float): Most new clients admitted per
+                second in batch mode, the rest get a WAIT. Bounds the burst
+                that gets in before the queue wait reflects it. Defaults to 5.
+            batch_beam_size (int): Beam width for batched decoding. The
+                default 1 is greedy, 5 matches ``transcriber.transcribe`` at
+                about 2.5x the decode time.
+            batch_temperature_fallback (bool): Re-decode batched items that
+                fail the quality check at higher temperatures. Each fallback
+                pass costs about as much as the first. Defaults to False.
+            segment_post_processor (callable, optional): A callable that receives
+                a transcription segment dict and returns a modified segment dict.
+                Applied to every segment before sending to the client. Useful for
+                plugging in custom post-processing (e.g. formatting, redaction).
+                Defaults to None.
+            transcript_finalizer (callable, optional): A callable that receives the
+                accumulated transcript (list of segment dicts) once the stream ends,
+                while the socket is still open, and may return a dict sent to the
+                client as a final message. Useful for cross-segment results (e.g.
+                paragraph grouping). Defaults to None.
+            audio_preprocessor (callable, optional): A callable
+                ``(frame_np, sample_rate) -> np.ndarray`` applied to every audio
+                frame before VAD and before it reaches the backend. Useful for
+                plugging in noise reduction on live audio. Defaults to None.
+            websocket_auth (callable, optional): A callable
+                ``(connection, request) -> Response | None`` passed to the
+                websocket server as ``process_request``. Returning a response
+                refuses the handshake. When ``api_key`` is also set both checks
+                must pass. Defaults to None.
+            default_model (str): The faster-whisper model the REST endpoint loads
+                when the request's ``model`` field is ``whisper-1`` or absent.
+                Defaults to "small". A custom model passed with
+                ``faster_whisper_custom_model_path`` takes precedence.
+        """
+        backend_ref = make_backend_ref(backend)  # ValueError for unknown names
+        self.backend_name = backend_ref.value
+        self.backend_opts = dict(backend_opts or {})
+        self.engine_model = model if isinstance(backend_ref, ExternalBackend) else None
+        if model:
+            if backend_ref == BackendType.FASTER_WHISPER and faster_whisper_custom_model_path is None:
+                faster_whisper_custom_model_path = model
+            elif backend_ref == BackendType.TENSORRT and whisper_tensorrt_path is None:
+                whisper_tensorrt_path = model
+
+        self.cache_path = cache_path
+        self.raw_pcm_input = raw_pcm_input
+        self.audio_preprocessor = audio_preprocessor
+        self.default_model = faster_whisper_custom_model_path or default_model
+
+        if max_clients < 1:
+            raise ValueError(f"max_clients must be >= 1, got {max_clients}")
+        if max_connection_time <= 0:
+            raise ValueError(f"max_connection_time must be > 0, got {max_connection_time}")
+        if batch_enabled and batch_max_size < 1:
+            raise ValueError(f"batch_max_size must be >= 1, got {batch_max_size}")
+        if batch_enabled and batch_window_ms < 0:
+            raise ValueError(f"batch_window_ms must be >= 0, got {batch_window_ms}")
+        if batch_enabled and batch_max_queue_wait_s <= 0:
+            raise ValueError(f"batch_max_queue_wait_s must be > 0, got {batch_max_queue_wait_s}")
+        if batch_enabled and batch_max_admissions_per_s <= 0:
+            raise ValueError(f"batch_max_admissions_per_s must be > 0, got {batch_max_admissions_per_s}")
+        if batch_enabled and batch_beam_size < 1:
+            raise ValueError(f"batch_beam_size must be >= 1, got {batch_beam_size}")
+
+        self.segment_post_processor = segment_post_processor
+        self.transcript_finalizer = transcript_finalizer
+        self.client_manager = ClientManager(max_clients, max_connection_time)
+        if faster_whisper_custom_model_path is not None and not os.path.exists(faster_whisper_custom_model_path):
+            if "/" not in faster_whisper_custom_model_path and faster_whisper_custom_model_path not in STOCK_MODEL_SIZES:
+                raise ValueError(f"Custom faster_whisper model '{faster_whisper_custom_model_path}' is not a valid path or HuggingFace model.")
+        if whisper_tensorrt_path is not None and not os.path.exists(whisper_tensorrt_path):
+            raise ValueError(f"TensorRT model '{whisper_tensorrt_path}' is not a valid path.")
+
+        # Batch inference config
+        if batch_enabled:
+            single_model = True  # Batch mode requires shared model
+            self.batch_config = {
+                'max_batch_size': batch_max_size,
+                'batch_window_ms': batch_window_ms,
+                'max_queue_wait_s': batch_max_queue_wait_s,
+                'beam_size': batch_beam_size,
+                'temperature_fallback': batch_temperature_fallback,
+            }
+            self.admission_limiter = AdmissionRateLimiter(batch_max_admissions_per_s)
+            logging.info(f"Batch inference enabled (max_batch={batch_max_size}, window={batch_window_ms}ms)")
+        else:
+            self.batch_config = None
+
+        if single_model:
+            if faster_whisper_custom_model_path or whisper_tensorrt_path:
+                logging.info("Custom model option was provided. Switching to single model mode.")
+                self.single_model = True
+                # TODO: load model initially
+            elif batch_enabled:
+                logging.info("Batch inference enabled. Switching to single model mode for stock model.")
+                self.single_model = True
+            else:
+                logging.info("Single model mode currently only works with custom models.")
+        if isinstance(backend_ref, ExternalBackend):
+            if enable_rest:
+                raise ValueError("The REST API only supports the Whisper backends")
+            self._preload_engine_backend()
+
+        # Start Prometheus metrics endpoint if port is specified
+        if metrics_port > 0:
+            wl_metrics.start_metrics_server(metrics_port)
+
+        # New OpenAI-compatible REST API (toggleable via enable_rest boolean)
+        if enable_rest:
+            app = self.build_rest_app(
+                backend,
+                faster_whisper_custom_model_path=faster_whisper_custom_model_path,
+                whisper_tensorrt_path=whisper_tensorrt_path,
+                cors_origins=cors_origins,
+                api_key=api_key,
+                rate_limit_rpm=rate_limit_rpm,
+            )
+
+            threading.Thread(
+                target=uvicorn.run,
+                args=(app,),
+                kwargs={"host": "0.0.0.0", "port": rest_port, "log_level": "info"},
+                daemon=True
+            ).start()
+            logging.info(f"✅ OpenAI-Compatible API started on http://0.0.0.0:{rest_port}")
+
+        # Original WebSocket server (always supported)
+        extra_ws_kwargs = {"select_subprotocol": _select_bearer_subprotocol}
+        handshake_checks = []
+        if api_key:
+            handshake_checks.append(functools.partial(_websocket_auth, api_key))
+        if websocket_auth is not None:
+            handshake_checks.append(websocket_auth)
+        if handshake_checks:
+            extra_ws_kwargs["process_request"] = functools.partial(
+                _all_websocket_checks, handshake_checks
+            )
+
+        with serve(
+            functools.partial(
+                self.recv_audio,
+                backend=backend_ref,
+                faster_whisper_custom_model_path=faster_whisper_custom_model_path,
+                whisper_tensorrt_path=whisper_tensorrt_path,
+                trt_multilingual=trt_multilingual,
+                trt_py_session=trt_py_session,
+            ),
+            host,
+            port,
+            **extra_ws_kwargs,
+        ) as server:
+            server.serve_forever()
+
+    def voice_activity(self, websocket, frame_np):
+        """
+        Evaluates the voice activity in a given audio frame and manages the state of voice activity detection.
+
+        This method uses the configured voice activity detection (VAD) model to assess whether the given audio frame
+        contains speech. If the VAD model detects no voice activity for more than three consecutive frames,
+        it sets an end-of-speech (EOS) flag for the associated client. This method aims to efficiently manage
+        speech detection to improve subsequent processing steps.
+
+        Args:
+            websocket: The websocket associated with the current client. Used to retrieve the client object
+                    from the client manager for state management.
+            frame_np (numpy.ndarray): The audio frame to be analyzed. This should be a NumPy array containing
+                                    the audio data for the current frame.
+
+        Returns:
+            bool: True if voice activity is detected in the current frame, False otherwise. When returning False
+                after detecting no voice activity for more than three consecutive frames, it also triggers the
+                end-of-speech (EOS) flag for the client.
+        """
+        if not self.vad_detector(frame_np):
+            self.no_voice_activity_chunks += 1
+            if self.no_voice_activity_chunks > 3:
+                client = self.client_manager.get_client(websocket)
+                if not client.eos:
+                    client.set_eos(True)
+                time.sleep(0.1)    # Sleep 100m; wait some voice activity.
+            return False
+        return True
+
+    def cleanup(self, websocket):
+        """
+        Cleans up resources associated with a given client's websocket.
+
+        Args:
+            websocket: The websocket associated with the client to be cleaned up.
+        """
+        client = self.client_manager.get_client(websocket)
+        if client:
+            if hasattr(client, 'translation_client') and client.translation_client:
+                client.translation_client.cleanup()
+                
+            # Wait for translation thread to finish
+            if hasattr(client, 'translation_thread') and client.translation_thread:
+                client.translation_thread.join(timeout=2.0)
+            self.client_manager.remove_client(websocket)
+        self.audio_formats.pop(websocket, None)
